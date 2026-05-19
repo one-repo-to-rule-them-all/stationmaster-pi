@@ -220,11 +220,91 @@ def phase_apt():
 # ─────────────────────────────────────────────────────────────────────────────
 # PHASE 2 — NAS mount
 # ─────────────────────────────────────────────────────────────────────────────
+def _resolve_nas_host(nas_unc: str) -> str:
+    """
+    Try to resolve the NAS hostname from NAS_UNC_PATH.
+    Attempt order: bare hostname → hostname.local (mDNS) → nmblookup (NetBIOS).
+    If a working variant is found, updates NAS_UNC_PATH in .env and returns
+    the corrected UNC path. Dies with a clear message if nothing resolves.
+    """
+    import re as _re
+    m = _re.match(r"//([^/]+)(/.+)", nas_unc)
+    if not m:
+        return nas_unc  # unusual format — pass through unchanged
+
+    hostname, share = m.group(1), m.group(2)
+
+    # Already an IP address — nothing to resolve
+    if _re.match(r"^\d+\.\d+\.\d+\.\d+$", hostname):
+        ok(f"NAS: using IP address directly ({hostname})")
+        return nas_unc
+
+    def try_hostname(h):
+        try:
+            ip = socket.gethostbyname(h)
+            return ip
+        except socket.gaierror:
+            return None
+
+    def try_nmblookup(h):
+        try:
+            result = subprocess.run(
+                ["nmblookup", h], capture_output=True, text=True, timeout=5
+            )
+            for line in result.stdout.splitlines():
+                parts = line.split()
+                if len(parts) >= 2 and _re.match(r"^\d+\.\d+\.\d+\.\d+$", parts[0]):
+                    if parts[0] not in ("0.0.0.0",):
+                        return parts[0]
+        except Exception:
+            pass
+        return None
+
+    # 1. Try bare hostname
+    ip = try_hostname(hostname)
+    if ip:
+        ok(f"NAS hostname '{hostname}' resolved → {ip}")
+        return nas_unc
+
+    warn(f"NAS hostname '{hostname}' not resolvable directly — trying alternatives...")
+
+    # 2. Try hostname.local (mDNS / Avahi)
+    mdns = hostname + ".local"
+    ip = try_hostname(mdns)
+    if ip:
+        new_unc = f"//{mdns}{share}"
+        ok(f"'{mdns}' resolved → {ip}  (updating NAS_UNC_PATH in .env)")
+        save_env("NAS_UNC_PATH", new_unc)
+        return new_unc
+
+    # 3. Try nmblookup (NetBIOS — requires samba-common or cifs-utils)
+    ip = try_nmblookup(hostname)
+    if ip:
+        new_unc = f"//{ip}{share}"
+        ok(f"nmblookup found NAS at {ip}  (updating NAS_UNC_PATH in .env)")
+        save_env("NAS_UNC_PATH", new_unc)
+        # Also add to /etc/hosts so fstab can resolve it at boot
+        hosts_line = f"{ip}  {hostname}\n"
+        existing = Path("/etc/hosts").read_text()
+        if hostname not in existing:
+            run_shell(f"echo '{ip}  {hostname}' | sudo tee -a /etc/hosts > /dev/null")
+            ok(f"Added {hostname} → {ip} to /etc/hosts for boot-time fstab resolution")
+        return new_unc
+
+    die(
+        f"Cannot reach NAS at '{hostname}'.\n"
+        f"  1. Make sure the WD MyCloud is powered on and on the same network.\n"
+        f"  2. Find its IP address (check your router's device list).\n"
+        f"  3. Edit .env and set: NAS_UNC_PATH=//<ip-address>/Public\n"
+        f"  4. Re-run bootstrap.py"
+    )
+
+
 def phase_nas():
     hdr("Phase 2 — NAS mount")
 
     mount_point = env("NAS_MOUNT_POINT", "/mnt/nas")
-    nas_unc     = env("NAS_UNC_PATH", "//WDMYCLOUD/Public")
+    nas_unc     = _resolve_nas_host(env("NAS_UNC_PATH", "//WDMYCLOUD/Public"))
     nas_user    = env("NAS_USER", "")
     nas_pass    = env("NAS_PASS", "")
     creds_file  = "/etc/stationmaster-nas.creds"
