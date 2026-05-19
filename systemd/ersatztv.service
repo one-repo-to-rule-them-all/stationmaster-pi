@@ -1,0 +1,33 @@
+[Unit]
+Description=ErsatzTV Legacy IPTV Server
+Documentation=https://github.com/ErsatzTV/legacy
+After=network-online.target
+Wants=network-online.target
+# Wait for NAS mount before starting (unit name mirrors the fstab mountpoint)
+After=mnt-nas.mount
+Wants=mnt-nas.mount
+
+[Service]
+Type=simple
+User=cmpe8803
+Group=cmpe8803
+
+# ErsatzTV uses XDG_DATA_HOME for its database and config.
+# HOME must be set correctly so it resolves ~/.local/share/ersatztv/
+Environment=HOME=/home/cmpe8803
+Environment=XDG_DATA_HOME=/home/cmpe8803/.local/share
+
+ExecStart=/opt/ersatztv/ErsatzTV
+Restart=on-failure
+RestartSec=10
+
+# Give ErsatzTV time to initialize before systemd considers it failed
+TimeoutStartSec=60
+
+# Logging: journal captures stdout/stderr — use `journalctl -u ersatztv -f`
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ersatztv
+
+[Install]
+WantedBy=multi-user.target
