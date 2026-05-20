@@ -156,6 +156,85 @@ def wait_for_http(url, timeout=120, interval=3, label=None):
     print()
     return False
 
+# ── Interactive config wizard ─────────────────────────────────────────────────
+_EXAMPLE_NAS_UNC = "//WDMYCLOUD/Public"
+
+def _prompt(label, current, secret=False, hint=None):
+    """Prompt the user for a value, showing the current/default inline."""
+    display = ("(hidden)" if secret and current else current) or ""
+    suffix  = f" [{display}]" if display else ""
+    if hint:
+        print(f"  {C.CYAN}hint:{C.RESET} {hint}")
+    try:
+        if secret:
+            import getpass
+            val = getpass.getpass(f"  {label}{suffix}: ")
+        else:
+            val = input(f"  {label}{suffix}: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        die("Setup cancelled.")
+    return val if val else current
+
+def _interactive_config():
+    """
+    Walk the user through the minimum required config values and write them
+    back to .env.  Only prompts for values that are missing or still set to
+    the placeholder defaults from .env.example.
+    """
+    print(f"\n{C.BOLD}{C.CYAN}── First-run setup wizard ────────────────────────────────{C.RESET}")
+    print("  Answer each question (press Enter to keep the value shown in brackets).\n")
+
+    changed = False
+
+    # ── NAS UNC path ──────────────────────────────────────────────────────────
+    nas_unc = env("NAS_UNC_PATH")
+    if not nas_unc or nas_unc == _EXAMPLE_NAS_UNC:
+        print(f"{C.BOLD}NAS share path{C.RESET}")
+        val = _prompt(
+            "NAS UNC path",
+            nas_unc or _EXAMPLE_NAS_UNC,
+            hint="e.g. //WDMYCLOUD/Public  or  //192.168.1.10/Public",
+        )
+        if val != nas_unc:
+            save_env("NAS_UNC_PATH", val)
+            changed = True
+
+    # ── NAS credentials ───────────────────────────────────────────────────────
+    nas_user = env("NAS_USER")
+    nas_pass = env("NAS_PASS")
+    if not nas_user and not nas_pass:
+        print(f"\n{C.BOLD}NAS credentials{C.RESET}  (leave blank for anonymous/guest access)")
+        u = _prompt("NAS username", nas_user or "media")
+        p = _prompt("NAS password", nas_pass or "", secret=True)
+        if u != nas_user:
+            save_env("NAS_USER", u)
+            changed = True
+        if p != nas_pass:
+            save_env("NAS_PASS", p)
+            changed = True
+
+    # ── Timezone ──────────────────────────────────────────────────────────────
+    tz = env("TZ", "America/Chicago")
+    if tz == "America/Chicago":
+        print(f"\n{C.BOLD}Timezone{C.RESET}")
+        val = _prompt(
+            "Timezone",
+            tz,
+            hint="e.g. America/New_York, Europe/London, Asia/Tokyo  "
+                 "(see https://en.wikipedia.org/wiki/List_of_tz_database_time_zones)",
+        )
+        if val != tz:
+            save_env("TZ", val)
+            changed = True
+
+    if changed:
+        load_dotenv(ENV_FILE, override=True)   # reload with new values
+        print()
+        ok("Config saved to .env")
+    else:
+        info("Config already complete — no changes needed.")
+
 # ─────────────────────────────────────────────────────────────────────────────
 # PHASE 0 — Preflight
 # ─────────────────────────────────────────────────────────────────────────────
@@ -171,13 +250,19 @@ def phase_preflight():
     if machine not in ("aarch64", "arm64"):
         warn(f"Detected architecture: {machine}. This script targets linux-arm64 (aarch64). Proceed with caution.")
 
-    # Confirm .env exists and is loaded
+    # Confirm .env exists and is loaded — creates from .env.example if missing
     load_env()
 
-    # Validate required env vars
+    # If required values are missing or still at example defaults, run the
+    # interactive wizard so the user never has to manually edit .env.
+    nas_unc = env("NAS_UNC_PATH")
+    if not nas_unc or nas_unc == _EXAMPLE_NAS_UNC:
+        _interactive_config()
+
+    # Final guard — wizard should have handled this, but be explicit
     nas_unc = env("NAS_UNC_PATH")
     if not nas_unc:
-        die("NAS_UNC_PATH is not set in .env. Edit .env and re-run.")
+        die("NAS_UNC_PATH is still not set. Check your .env file and re-run.")
 
     ok("Preflight passed.")
     info(f"NAS path : {nas_unc}")
