@@ -587,15 +587,17 @@ def discover_media(conn) -> dict:
         groups.setdefault(group, []).append(mid)
 
     # TV episodes → group by show title, ordered by season + episode
+    # EpisodeNumber lives in EpisodeMetadata in ErsatzTV v26+, not Episode
     rows = qall(conn, """
         SELECT DISTINCT mi.Id, sm.Title,
                COALESCE(sea.SeasonNumber, 0) AS SeasonNum,
-               COALESCE(e.EpisodeNumber, 0)  AS EpNum
+               COALESCE(em.EpisodeNumber, 0)  AS EpNum
         FROM   MediaItem      mi
-        JOIN   Episode        e   ON e.Id      = mi.Id
-        JOIN   Season         sea ON sea.Id    = e.SeasonId
-        JOIN   Show           s   ON s.Id      = sea.ShowId
-        JOIN   ShowMetadata   sm  ON sm.ShowId = s.Id
+        JOIN   Episode        e   ON e.Id        = mi.Id
+        JOIN   EpisodeMetadata em ON em.EpisodeId = e.Id
+        JOIN   Season         sea ON sea.Id      = e.SeasonId
+        JOIN   Show           s   ON s.Id        = sea.ShowId
+        JOIN   ShowMetadata   sm  ON sm.ShowId   = s.Id
         ORDER BY sm.Title, SeasonNum, EpNum
     """)
     for r in rows:

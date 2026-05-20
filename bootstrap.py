@@ -1051,24 +1051,40 @@ def phase_etv_first_run():
             stderr=subprocess.DEVNULL,
         )
 
-    # Wait for SQLite DB to appear
-    info("Waiting for ErsatzTV to create its database...")
-    deadline = time.time() + 120
+    # Wait for SQLite DB to appear — Pi 5 can take a few minutes on first run
+    info("Waiting for ErsatzTV to create its database (up to 5 min)...")
+    DB_TIMEOUT = 300
+    deadline = time.time() + DB_TIMEOUT
     while time.time() < deadline:
         if db_path.exists() and db_path.stat().st_size > 0:
             ok(f"ErsatzTV database created: {db_path}")
             break
-        elapsed = int(time.time() - (deadline - 120))
-        print(f"  Waiting for DB... ({elapsed}s)", end="\r", flush=True)
-        time.sleep(3)
+        # Check process is still alive
+        alive = run_shell("pgrep -f ErsatzTV", check=False, capture=True).returncode == 0
+        elapsed = int(time.time() - (deadline - DB_TIMEOUT))
+        status = "running" if alive else "CRASHED"
+        print(f"  Waiting for DB... ({elapsed}s / {DB_TIMEOUT}s) [{status}]", end="\r", flush=True)
+        if not alive and elapsed > 10:
+            print()
+            # Check logs for crash reason
+            log_dir = db_path.parent / "logs"
+            if log_dir.exists():
+                logs = sorted(log_dir.glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+                if logs:
+                    last_lines = run_shell(f"tail -20 {logs[0]}", check=False, capture=True).stdout
+                    warn(f"ErsatzTV crashed. Last log lines:\n{last_lines}")
+            die(f"ErsatzTV process died before creating the database.\n"
+                f"Re-run with: python3 bootstrap.py --skip-apt --skip-nas --skip-jellyfin --skip-wizard --skip-libs")
+        time.sleep(5)
     else:
-        die(f"ErsatzTV DB not found at {db_path} after 2 minutes.\n"
-            f"Check ErsatzTV logs in ~/.local/share/ersatztv/logs/")
+        print()
+        die(f"ErsatzTV DB not found at {db_path} after {DB_TIMEOUT}s.\n"
+            f"Check logs: ls ~/.local/share/ersatztv/logs/")
     print()
 
     # Wait for API to respond
-    info("Waiting for ErsatzTV API...")
-    if not wait_for_http(f"{etv_host}/iptv/channels.m3u", timeout=120, label="ErsatzTV API"):
+    info("Waiting for ErsatzTV API (up to 3 min)...")
+    if not wait_for_http(f"{etv_host}/iptv/channels.m3u", timeout=180, label="ErsatzTV API"):
         die("ErsatzTV API not responding. Check ~/.local/share/ersatztv/logs/")
     ok("ErsatzTV API is up.")
 
@@ -1392,7 +1408,7 @@ def main():
         phase_nas()
     else:
         load_env()
-        info("Skipping NAS setup — loading .env.")
+        info("Skipping NAS setup -- loading .env.")
 
     if not args.skip_jellyfin:
         phase_install_jellyfin()
