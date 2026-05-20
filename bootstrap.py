@@ -156,11 +156,16 @@ def wait_for_http(url, timeout=120, interval=3, label=None):
     print()
     return False
 
-# ── Interactive config wizard ─────────────────────────────────────────────────
+# ── Auto-detection + fallback config ─────────────────────────────────────────
 _EXAMPLE_NAS_UNC = "//WDMYCLOUD/Public"
 
+# Common WD MyCloud / NAS hostnames to probe, in order
+_WD_HOSTNAMES = ["wdmycloud", "WDMYCLOUD", "wdmycloud.local", "wdcloud", "mybooklive"]
+# Common share names to try after finding the host
+_WD_SHARES    = ["Public", "public", "Shared", "share"]
+
 def _prompt(label, current, secret=False, hint=None):
-    """Prompt the user for a value, showing the current/default inline."""
+    """Last-resort interactive prompt — only called when auto-detection fails."""
     display = ("(hidden)" if secret and current else current) or ""
     suffix  = f" [{display}]" if display else ""
     if hint:
@@ -176,64 +181,230 @@ def _prompt(label, current, secret=False, hint=None):
         die("Setup cancelled.")
     return val if val else current
 
-def _interactive_config():
-    """
-    Walk the user through the minimum required config values and write them
-    back to .env.  Only prompts for values that are missing or still set to
-    the placeholder defaults from .env.example.
-    """
-    print(f"\n{C.BOLD}{C.CYAN}── First-run setup wizard ────────────────────────────────{C.RESET}")
-    print("  Answer each question (press Enter to keep the value shown in brackets).\n")
+def _detect_system_timezone():
+    """Read the system timezone — timedatectl, /etc/timezone, or symlink."""
+    # 1. timedatectl (most reliable on systemd)
+    try:
+        r = subprocess.run(
+            ["timedatectl", "show", "--property=Timezone", "--value"],
+            capture_output=True, text=True, timeout=5
+        )
+        tz = r.stdout.strip()
+        if tz and "/" in tz:
+            return tz
+    except Exception:
+        pass
+    # 2. /etc/timezone (Debian/Ubuntu)
+    try:
+        tz = Path("/etc/timezone").read_text().strip()
+        if tz and "/" in tz:
+            return tz
+    except Exception:
+        pass
+    # 3. /etc/localtime symlink → zoneinfo
+    try:
+        link = Path("/etc/localtime").resolve()
+        parts = link.parts
+        zi = next((i for i, p in enumerate(parts) if p == "zoneinfo"), None)
+        if zi and zi + 2 <= len(parts):
+            return "/".join(parts[zi + 1:])
+    except Exception:
+        pass
+    return None
 
+def _scan_smb_host(ip, timeout=1):
+    """Return True if port 445 (SMB) is open on ip."""
+    try:
+        with socket.create_connection((ip, 445), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+def _get_subnet_prefix():
+    """Return the /24 prefix of the Pi's primary LAN IP (e.g. '192.168.1')."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+        parts = ip.split(".")
+        return ".".join(parts[:3])
+    except Exception:
+        return None
+
+def _smb_shares_for_host(host):
+    """Return list of share names on host via smbclient (anonymous), or []."""
+    try:
+        r = subprocess.run(
+            ["smbclient", "-L", f"//{host}", "-N", "--no-pass"],
+            capture_output=True, text=True, timeout=8
+        )
+        shares = []
+        for line in r.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[1] in ("Disk",):
+                shares.append(parts[0].strip())
+        return shares
+    except Exception:
+        return []
+
+def _discover_nas():
+    """
+    Auto-discover a NAS on the LAN. Strategy:
+      1. Try well-known WD hostnames (hostname + .local)
+      2. nmblookup broadcast for known names
+      3. Port-scan the /24 subnet for SMB (445) — fast parallel scan
+    Returns a UNC string like //192.168.1.10/Public, or None.
+    """
+    import concurrent.futures
+    import re as _re
+
+    info("Auto-discovering NAS on your network...")
+
+    def probe_host(host):
+        """Return (ip, shares) if host has SMB open, else None."""
+        ip = None
+        try:
+            ip = socket.gethostbyname(host)
+        except socket.gaierror:
+            pass
+        if ip and _scan_smb_host(ip):
+            shares = _smb_shares_for_host(host)
+            return ip, shares
+        # Also try the raw IP directly if we have it
+        if ip and _scan_smb_host(ip, timeout=1):
+            return ip, []
+        return None
+
+    found = {}  # ip → shares
+
+    # 1. Known hostnames
+    for name in _WD_HOSTNAMES:
+        result = probe_host(name)
+        if result:
+            ip, shares = result
+            if ip not in found:
+                found[ip] = shares
+                ok(f"  Found NAS: {name} ({ip})  shares={shares or ['(unknown)']}")
+
+    # 2. nmblookup broadcast
+    if not found:
+        try:
+            r = subprocess.run(
+                ["nmblookup", "-S", "*"],
+                capture_output=True, text=True, timeout=8
+            )
+            for line in r.stdout.splitlines():
+                m = _re.match(r"^(\d+\.\d+\.\d+\.\d+)\s+", line)
+                if m:
+                    ip = m.group(1)
+                    if ip not in found and ip != "0.0.0.0" and _scan_smb_host(ip):
+                        shares = _smb_shares_for_host(ip)
+                        found[ip] = shares
+                        ok(f"  Found NAS via NetBIOS: {ip}  shares={shares or ['(unknown)']}")
+        except Exception:
+            pass
+
+    # 3. Subnet port scan (parallel, fast — 1s timeout per host)
+    if not found:
+        prefix = _get_subnet_prefix()
+        if prefix:
+            info(f"  Scanning {prefix}.0/24 for SMB hosts (this takes ~10s)...")
+            candidates = [f"{prefix}.{i}" for i in range(1, 255)]
+            with concurrent.futures.ThreadPoolExecutor(max_workers=64) as ex:
+                futures = {ex.submit(_scan_smb_host, ip): ip for ip in candidates}
+                for fut in concurrent.futures.as_completed(futures):
+                    ip = futures[fut]
+                    if fut.result():
+                        shares = _smb_shares_for_host(ip)
+                        found[ip] = shares
+                        ok(f"  Found SMB host: {ip}  shares={shares or ['(unknown)']}")
+
+    if not found:
+        return None
+
+    # Pick best candidate — prefer one that has a recognised share name
+    for ip, shares in found.items():
+        for share in _WD_SHARES:
+            if share in shares:
+                unc = f"//{ip}/{share}"
+                ok(f"  Selected NAS: {unc}")
+                return unc
+        # No recognised share but host is there — use first share or Public
+        share = shares[0] if shares else "Public"
+        unc = f"//{ip}/{share}"
+        ok(f"  Selected NAS: {unc}")
+        return unc
+
+def _test_anonymous_smb(nas_unc):
+    """Return True if the NAS accepts anonymous/guest connections."""
+    try:
+        r = subprocess.run(
+            ["smbclient", nas_unc, "-N", "--no-pass", "-c", "ls"],
+            capture_output=True, text=True, timeout=10
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+def _autodetect_config():
+    """
+    Silently detect timezone, NAS, and credentials.
+    Only falls back to prompting for things it genuinely cannot figure out.
+    """
+    hdr("Phase 0a — Auto-detecting configuration")
     changed = False
 
-    # ── NAS UNC path ──────────────────────────────────────────────────────────
-    nas_unc = env("NAS_UNC_PATH")
+    # ── Timezone ──────────────────────────────────────────────────────────────
+    tz = env("TZ", "")
+    if not tz or tz == "America/Chicago":
+        detected = _detect_system_timezone()
+        if detected:
+            ok(f"Timezone detected from system: {detected}")
+            save_env("TZ", detected)
+            changed = True
+        else:
+            warn("Could not detect system timezone.")
+            val = _prompt("Timezone", "America/Chicago",
+                          hint="e.g. America/New_York, Europe/London")
+            save_env("TZ", val)
+            changed = True
+
+    # ── NAS discovery ─────────────────────────────────────────────────────────
+    nas_unc = env("NAS_UNC_PATH", "")
     if not nas_unc or nas_unc == _EXAMPLE_NAS_UNC:
-        print(f"{C.BOLD}NAS share path{C.RESET}")
-        val = _prompt(
-            "NAS UNC path",
-            nas_unc or _EXAMPLE_NAS_UNC,
-            hint="e.g. //WDMYCLOUD/Public  or  //192.168.1.10/Public",
-        )
-        if val != nas_unc:
+        discovered = _discover_nas()
+        if discovered:
+            save_env("NAS_UNC_PATH", discovered)
+            changed = True
+        else:
+            warn("Could not auto-discover a NAS on this network.")
+            val = _prompt("NAS UNC path", _EXAMPLE_NAS_UNC,
+                          hint="e.g. //WDMYCLOUD/Public  or  //192.168.1.10/Public")
             save_env("NAS_UNC_PATH", val)
             changed = True
 
     # ── NAS credentials ───────────────────────────────────────────────────────
-    nas_user = env("NAS_USER")
-    nas_pass = env("NAS_PASS")
-    if not nas_user and not nas_pass:
-        print(f"\n{C.BOLD}NAS credentials{C.RESET}  (leave blank for anonymous/guest access)")
-        u = _prompt("NAS username", nas_user or "media")
-        p = _prompt("NAS password", nas_pass or "", secret=True)
-        if u != nas_user:
+    nas_user = env("NAS_USER", "")
+    nas_pass = env("NAS_PASS", "")
+    current_unc = env("NAS_UNC_PATH", "")
+    if not nas_user and not nas_pass and current_unc:
+        if _test_anonymous_smb(current_unc):
+            ok("NAS accepts anonymous/guest access — no credentials needed.")
+            save_env("NAS_USER", "")
+            save_env("NAS_PASS", "")
+        else:
+            warn("NAS requires credentials.")
+            u = _prompt("NAS username", "media")
+            p = _prompt("NAS password", "", secret=True)
             save_env("NAS_USER", u)
-            changed = True
-        if p != nas_pass:
             save_env("NAS_PASS", p)
             changed = True
 
-    # ── Timezone ──────────────────────────────────────────────────────────────
-    tz = env("TZ", "America/Chicago")
-    if tz == "America/Chicago":
-        print(f"\n{C.BOLD}Timezone{C.RESET}")
-        val = _prompt(
-            "Timezone",
-            tz,
-            hint="e.g. America/New_York, Europe/London, Asia/Tokyo  "
-                 "(see https://en.wikipedia.org/wiki/List_of_tz_database_time_zones)",
-        )
-        if val != tz:
-            save_env("TZ", val)
-            changed = True
-
     if changed:
-        load_dotenv(ENV_FILE, override=True)   # reload with new values
-        print()
-        ok("Config saved to .env")
+        load_dotenv(ENV_FILE, override=True)
+        ok("Config written to .env")
     else:
-        info("Config already complete — no changes needed.")
+        info("Config already set — skipping auto-detection.")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PHASE 0 — Preflight
@@ -253,11 +424,11 @@ def phase_preflight():
     # Confirm .env exists and is loaded — creates from .env.example if missing
     load_env()
 
-    # If required values are missing or still at example defaults, run the
-    # interactive wizard so the user never has to manually edit .env.
+    # Auto-detect timezone, NAS, and credentials.
+    # Only prompts for things it genuinely cannot figure out.
     nas_unc = env("NAS_UNC_PATH")
     if not nas_unc or nas_unc == _EXAMPLE_NAS_UNC:
-        _interactive_config()
+        _autodetect_config()
 
     # Final guard — wizard should have handled this, but be explicit
     nas_unc = env("NAS_UNC_PATH")
