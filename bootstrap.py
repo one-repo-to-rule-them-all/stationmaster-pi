@@ -635,26 +635,41 @@ def phase_nas():
 # ─────────────────────────────────────────────────────────────────────────────
 # PHASE 3 — Install Jellyfin
 # ─────────────────────────────────────────────────────────────────────────────
+def _reset_jellyfin():
+    """Stop Jellyfin, kill anything on 8096, wipe data dirs, recreate clean."""
+    run_shell("sudo systemctl stop jellyfin 2>/dev/null || true", check=False)
+    run_shell("sudo fuser -k 8096/tcp 2>/dev/null || true", check=False)
+    run_shell("sudo pkill -f jellyfin 2>/dev/null || true", check=False)
+    time.sleep(2)
+    for d in ["/var/lib/jellyfin", "/etc/jellyfin", "/var/log/jellyfin", "/var/cache/jellyfin"]:
+        run(["rm", "-rf", d], sudo=True, check=False)
+        run(["mkdir", "-p", d], sudo=True)
+        run(["chown", "jellyfin:jellyfin", d], sudo=True)
+    run(["systemctl", "daemon-reload"], sudo=True)
+
+
 def phase_install_jellyfin():
     hdr("Phase 3 — Install Jellyfin")
 
-    # Check if already installed
+    # Always start clean — kill stale processes and reset data dirs so the
+    # wizard always runs against a fresh instance with known credentials.
+    info("Resetting any existing Jellyfin state...")
+    _reset_jellyfin()
+
+    # Install if not present
     result = run_shell("dpkg -l jellyfin 2>/dev/null | grep -q '^ii'", check=False)
-    if result.returncode == 0:
-        ok("Jellyfin already installed.")
-        return
-
-    info("Adding Jellyfin apt repository...")
-    # Official Jellyfin install script handles repo setup and GPG key
-    run_shell("curl -fsSL https://repo.jellyfin.org/install-debuntu.sh | sudo bash")
-
-    info("Installing Jellyfin...")
-    run(["apt-get", "install", "-y", "jellyfin"], sudo=True)
+    if result.returncode != 0:
+        info("Adding Jellyfin apt repository...")
+        run_shell("curl -fsSL https://repo.jellyfin.org/install-debuntu.sh | sudo bash")
+        info("Installing Jellyfin...")
+        run(["apt-get", "install", "-y", "jellyfin"], sudo=True)
+    else:
+        ok("Jellyfin package already installed — starting fresh instance.")
 
     run(["systemctl", "enable", "jellyfin"], sudo=True)
     run(["systemctl", "start", "jellyfin"], sudo=True)
 
-    ok("Jellyfin installed and started.")
+    ok("Jellyfin started.")
     info("Waiting for Jellyfin to become ready...")
 
     jf_host = env("JELLYFIN_HOST", "http://localhost:8096")
@@ -666,63 +681,113 @@ def phase_install_jellyfin():
 # ─────────────────────────────────────────────────────────────────────────────
 # PHASE 4 — Jellyfin first-run wizard
 # ─────────────────────────────────────────────────────────────────────────────
-def phase_jellyfin_wizard():
-    hdr("Phase 4 — Jellyfin first-run wizard")
+def _try_jf_auth(jf_host, jf_user, jf_pass):
+    """Try to authenticate — returns token string on success, None on failure (no die)."""
+    try:
+        r = requests.post(
+            f"{jf_host}/Users/AuthenticateByName",
+            json={"Username": jf_user, "Pw": jf_pass},
+            headers={
+                "X-Emby-Authorization": (
+                    'MediaBrowser Client="stationmaster", Device="bootstrap", '
+                    'DeviceId="bootstrap_001", Version="1.0"'
+                )
+            },
+            timeout=15,
+        )
+        if r.status_code == 200:
+            return r.json()["AccessToken"]
+    except Exception:
+        pass
+    return None
 
-    jf_host  = env("JELLYFIN_HOST", "http://localhost:8096")
-    jf_user  = env("JELLYFIN_ADMIN_USER", "cmpe8803")
-    jf_pass  = env("JELLYFIN_ADMIN_PASS", "")
 
-    if not jf_pass:
-        jf_pass = gen_password()
-        save_env("JELLYFIN_ADMIN_PASS", jf_pass)
-        ok(f"Generated admin password and saved to .env")
-
-    # Wait for Jellyfin's internal state machine to be fully ready
-    # (health endpoint responding is not enough — wizard API needs extra time)
+def _run_jellyfin_wizard(jf_host, jf_user, jf_pass):
+    """
+    Execute the Jellyfin startup wizard API sequence.
+    Waits up to 120s for the wizard endpoint, then retries user creation
+    up to 8 times with backoff. Dies only if all retries are exhausted.
+    """
     info("Waiting for Jellyfin wizard API to be ready...")
-    wizard_ready = False
-    deadline = time.time() + 60
+    wizard_status = None
+    deadline = time.time() + 120
     while time.time() < deadline:
         try:
             r = requests.get(f"{jf_host}/Startup/Configuration", timeout=5)
-            if r.status_code == 404:
-                ok("Jellyfin wizard already completed.")
-                return
-            if r.status_code == 200:
-                wizard_ready = True
+            wizard_status = r.status_code
+            if r.status_code in (200, 404):
                 break
         except Exception:
             pass
+        elapsed = int(time.time() - (deadline - 120))
+        print(f"  Waiting for wizard API... ({elapsed}s)", end="\r", flush=True)
         time.sleep(3)
+    print()
 
-    if not wizard_ready:
-        die("Jellyfin wizard API didn't become ready within 60s. Try re-running with --skip-jellyfin.")
+    if wizard_status is None:
+        die("Jellyfin wizard API never responded. Check: journalctl -u jellyfin -n 50")
 
-    info("Running Jellyfin startup wizard...")
+    if wizard_status == 404:
+        return  # wizard already done
 
-    # Step 1: Initial configuration
+    # Step 1: locale
     requests.post(f"{jf_host}/Startup/Configuration",
         json={"UICulture": "en-US", "MetadataCountryCode": "US", "PreferredMetadataLanguage": "en"},
         timeout=15)
     time.sleep(2)
 
-    # Step 2: Create admin user — retry up to 5 times in case Jellyfin needs a moment
+    # Step 2: admin user — retry with backoff
     last_err = None
-    for attempt in range(5):
+    for attempt in range(8):
         r = requests.post(f"{jf_host}/Startup/User",
             json={"Name": jf_user, "Password": jf_pass},
             timeout=15)
         if r.status_code in (200, 204):
             break
         last_err = f"{r.status_code} {r.text[:200]}"
-        warn(f"  Wizard user creation attempt {attempt+1} returned {r.status_code} — retrying in 3s...")
-        time.sleep(3)
+        warn(f"  Wizard attempt {attempt + 1}/8 → {r.status_code}, retrying in 5s...")
+        time.sleep(5)
     else:
-        die(f"Jellyfin wizard user creation failed after 5 attempts: {last_err}")
+        die(f"Jellyfin wizard user creation failed after 8 attempts: {last_err}")
 
-    # Step 3: Complete wizard
+    # Step 3: complete
     requests.post(f"{jf_host}/Startup/Complete", timeout=15)
+
+
+def phase_jellyfin_wizard():
+    hdr("Phase 4 — Jellyfin first-run wizard")
+
+    jf_host = env("JELLYFIN_HOST", "http://localhost:8096")
+    jf_user = env("JELLYFIN_ADMIN_USER", "cmpe8803")
+    jf_pass = env("JELLYFIN_ADMIN_PASS", "")
+
+    if not jf_pass:
+        jf_pass = gen_password()
+        save_env("JELLYFIN_ADMIN_PASS", jf_pass)
+        ok("Generated admin password and saved to .env")
+
+    _run_jellyfin_wizard(jf_host, jf_user, jf_pass)
+
+    # Verify we can actually authenticate with the stored credentials.
+    # If not (e.g. wizard was previously completed with a different password),
+    # reset Jellyfin entirely and redo — no user interaction required.
+    info("Verifying credentials...")
+    token = _try_jf_auth(jf_host, jf_user, jf_pass)
+    if token:
+        ok(f"Jellyfin wizard complete. Admin: {jf_user} / (see .env for password)")
+        return
+
+    warn("Credential mismatch detected — resetting Jellyfin and re-running wizard...")
+    _reset_jellyfin()
+    run(["systemctl", "start", "jellyfin"], sudo=True)
+    if not wait_for_http(f"{jf_host}/health", timeout=120, label="Jellyfin"):
+        die("Jellyfin didn't recover after credential reset.")
+
+    _run_jellyfin_wizard(jf_host, jf_user, jf_pass)
+
+    token = _try_jf_auth(jf_host, jf_user, jf_pass)
+    if not token:
+        die("Jellyfin auth failed even after a clean reset. Check journalctl -u jellyfin -n 50")
 
     ok(f"Jellyfin wizard complete. Admin: {jf_user} / (see .env for password)")
 
@@ -902,18 +967,33 @@ def phase_install_etv():
     info(f"Downloading {asset_name} ({release['assets'][0].get('size', '?')} bytes)...")
     tmp_tar = Path(f"/tmp/{asset_name}")
 
-    # Stream download with progress
-    with requests.get(asset_url, stream=True, timeout=300) as dl:
-        total = int(dl.headers.get("content-length", 0))
-        downloaded = 0
-        with open(tmp_tar, "wb") as f:
-            for chunk in dl.iter_content(chunk_size=8192):
-                f.write(chunk)
-                downloaded += len(chunk)
-                if total:
-                    pct = int(downloaded * 100 / total)
-                    print(f"  Downloading... {pct}%", end="\r", flush=True)
-    print()
+    # Stream download with progress + resume on SSL/network errors
+    MAX_ATTEMPTS = 5
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            already = tmp_tar.stat().st_size if tmp_tar.exists() else 0
+            headers_dl = {"Range": f"bytes={already}-"} if already else {}
+            mode = "ab" if already else "wb"
+            with requests.get(asset_url, stream=True, timeout=300, headers=headers_dl) as dl:
+                total = int(dl.headers.get("content-length", 0)) + already
+                downloaded = already
+                with open(tmp_tar, mode) as f:
+                    for chunk in dl.iter_content(chunk_size=65536):
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if total:
+                            pct = int(downloaded * 100 / total)
+                            print(f"  Downloading... {pct}%  ({downloaded // 1048576}MB / {total // 1048576}MB)",
+                                  end="\r", flush=True)
+            print()
+            break  # success
+        except Exception as e:
+            print()
+            if attempt < MAX_ATTEMPTS:
+                warn(f"  Download interrupted (attempt {attempt}/{MAX_ATTEMPTS}): {e} — resuming in 5s...")
+                time.sleep(5)
+            else:
+                die(f"ErsatzTV download failed after {MAX_ATTEMPTS} attempts: {e}")
     ok(f"Downloaded to {tmp_tar}")
 
     # Extract
@@ -1261,12 +1341,12 @@ def print_summary():
   Jellyfin        : http://{lan_ip}:8096
   ErsatzTV        : http://{lan_ip}:8409
 
-  ── Next step ─────────────────────────────────────────────
-  Open Jellyfin → Live TV → Guide
+  -- Next step --------------------------------------------------
+  Open Jellyfin > Live TV > Guide
   If the guide is empty, wait 60s and refresh the page.
   If channels are missing, run: python3 tools/diagnose.py
 
-  ── Day-2 operations ──────────────────────────────────────
+  -- Day-2 operations --------------------------------------------
   Health check    : python3 tools/diagnose.py
   Rebuild channels: python3 full_setup.py
   Factory reset   : python3 tools/factory_reset.py --yes
@@ -1298,7 +1378,7 @@ def main():
         args.skip_jellyfin = True
         args.skip_wizard   = True
 
-    print(f"\n{C.BOLD}{C.CYAN}stationmaster-pi bootstrap{C.RESET}")
+    print(f"\n\033[1m\033[0;36mstationmaster-pi bootstrap\033[0m")
     print(f"{'─'*60}")
 
     phase_preflight()
