@@ -19,10 +19,15 @@ Environment=XDG_DATA_HOME=/home/cmpe8803/.local/share
 
 ExecStart=/opt/ersatztv/ErsatzTV
 Restart=on-failure
-RestartSec=10
+RestartSec=15
 
 # Give ErsatzTV time to initialize before systemd considers it failed
-TimeoutStartSec=60
+TimeoutStartSec=120
+
+# Don't keep restarting indefinitely if something is fundamentally broken —
+# stop trying after 3 failures in 5 minutes and let the admin investigate.
+StartLimitIntervalSec=300
+StartLimitBurst=3
 
 # Logging: journal captures stdout/stderr — use `journalctl -u ersatztv -f`
 StandardOutput=journal

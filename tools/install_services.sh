@@ -38,6 +38,18 @@ chmod 644 /etc/systemd/system/ersatztv.service
 
 systemctl daemon-reload
 systemctl enable ersatztv
+
+# Kill any ErsatzTV process started by bootstrap (Popen) before systemd takes over.
+# If a stale instance is running, systemd's start will fail with "Another instance already running."
+if pgrep -f ErsatzTV &>/dev/null; then
+    warn "Stopping ErsatzTV process started by bootstrap (handing off to systemd)..."
+    pkill -TERM -f ErsatzTV 2>/dev/null || true
+    sleep 3
+    # Force-kill if still alive
+    pkill -KILL -f ErsatzTV 2>/dev/null || true
+    sleep 1
+fi
+
 systemctl start ersatztv || warn "ErsatzTV failed to start immediately — check: journalctl -u ersatztv -n 50"
 
 # ── startup_sync service (self-healer) ────────────────────────────────────────

@@ -828,26 +828,34 @@ def phase_jellyfin_libraries():
         "Content-Type": "application/json",
     }
 
-    def resolve_path(preferred, *fallbacks):
-        """Return first path that exists on disk, or the preferred path with a warning."""
-        for p in (preferred, *fallbacks):
-            if Path(p).exists():
-                return p
-        warn(f"  No path found on disk for any of: {[preferred, *fallbacks]}")
-        warn(f"  Skipping — add this library manually in Jellyfin after setup.")
-        return None
+    # Fetch existing libraries upfront so we never create duplicates.
+    # Retry because Jellyfin may be busy scanning on first call.
+    info("Fetching existing Jellyfin libraries...")
+    existing_names = set()
+    for attempt in range(1, 7):
+        try:
+            r = requests.get(f"{jf_host}/Library/VirtualFolders",
+                             headers=headers, timeout=60)
+            if r.status_code == 200:
+                existing_names = {lib["Name"] for lib in r.json()}
+                ok(f"  Existing libraries: {existing_names or '(none)'}")
+                break
+        except requests.exceptions.Timeout:
+            warn(f"  Jellyfin busy (attempt {attempt}/6) — retrying in 15s...")
+            time.sleep(15)
+    else:
+        warn("  Could not fetch existing libraries — will attempt adds anyway.")
 
     def add_library(name, media_type, paths):
-        # Filter out None (paths that don't exist)
-        valid = [p for p in paths if p is not None]
+        # Skip if already exists
+        if name in existing_names:
+            info(f"  Library '{name}' already exists — skipping.")
+            return
+        # Filter out None / non-existent paths
+        valid = [p for p in paths if p is not None and Path(p).exists()]
         if not valid:
             warn(f"  Skipping library '{name}' — no valid paths found on disk.")
-            return
-        # Verify every path actually exists before calling API
-        missing = [p for p in valid if not Path(p).exists()]
-        if missing:
-            warn(f"  Skipping library '{name}' — paths not found: {missing}")
-            warn(f"  Add manually in Jellyfin once NAS paths are confirmed.")
+            warn(f"  Add manually in Jellyfin: Dashboard -> Libraries -> + Add Media Library")
             return
         payload = {
             "LibraryOptions": {
@@ -856,20 +864,32 @@ def phase_jellyfin_libraries():
                 "PathInfos": [{"Path": p} for p in valid],
             }
         }
-        r = requests.post(
-            f"{jf_host}/Library/VirtualFolders",
-            params={"name": name, "collectionType": media_type, "refreshLibrary": "false"},
-            json=payload,
-            headers=headers,
-            timeout=30,
-        )
-        if r.status_code in (200, 204):
-            ok(f"  Library added: {name} → {valid}")
-        elif r.status_code == 409:
-            info(f"  Library '{name}' already exists — skipping.")
-        else:
-            warn(f"  Library '{name}' failed: HTTP {r.status_code} — {r.text[:200]}")
-            warn(f"  Add manually in Jellyfin: Dashboard -> Libraries -> + Add Media Library")
+        # Retry up to 5x with increasing backoff — Jellyfin drops connections under scan load
+        for attempt in range(1, 6):
+            try:
+                r = requests.post(
+                    f"{jf_host}/Library/VirtualFolders",
+                    params={"name": name, "collectionType": media_type, "refreshLibrary": "false"},
+                    json=payload,
+                    headers=headers,
+                    timeout=120,
+                )
+                if r.status_code in (200, 204):
+                    ok(f"  Library added: {name} → {valid}")
+                    existing_names.add(name)
+                    return
+                elif r.status_code == 409:
+                    info(f"  Library '{name}' already exists — skipping.")
+                    existing_names.add(name)
+                    return
+                else:
+                    warn(f"  Library '{name}' failed: HTTP {r.status_code} — {r.text[:200]}")
+                    return
+            except requests.exceptions.Timeout:
+                wait = attempt * 20
+                warn(f"  Jellyfin timeout on '{name}' (attempt {attempt}/5) — retrying in {wait}s...")
+                time.sleep(wait)
+        warn(f"  Giving up on '{name}' after 5 attempts — add manually in Jellyfin UI.")
 
     # ── Movies ────────────────────────────────────────────────────────────────
     # Support both split Kids/Adult layout and flat Movies layout.
