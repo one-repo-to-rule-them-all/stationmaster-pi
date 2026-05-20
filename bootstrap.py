@@ -828,12 +828,32 @@ def phase_jellyfin_libraries():
         "Content-Type": "application/json",
     }
 
+    def resolve_path(preferred, *fallbacks):
+        """Return first path that exists on disk, or the preferred path with a warning."""
+        for p in (preferred, *fallbacks):
+            if Path(p).exists():
+                return p
+        warn(f"  No path found on disk for any of: {[preferred, *fallbacks]}")
+        warn(f"  Skipping — add this library manually in Jellyfin after setup.")
+        return None
+
     def add_library(name, media_type, paths):
+        # Filter out None (paths that don't exist)
+        valid = [p for p in paths if p is not None]
+        if not valid:
+            warn(f"  Skipping library '{name}' — no valid paths found on disk.")
+            return
+        # Verify every path actually exists before calling API
+        missing = [p for p in valid if not Path(p).exists()]
+        if missing:
+            warn(f"  Skipping library '{name}' — paths not found: {missing}")
+            warn(f"  Add manually in Jellyfin once NAS paths are confirmed.")
+            return
         payload = {
             "LibraryOptions": {
                 "EnableRealtimeMonitor": True,
                 "EnableChapterImageExtraction": False,
-                "PathInfos": [{"Path": p} for p in paths],
+                "PathInfos": [{"Path": p} for p in valid],
             }
         }
         r = requests.post(
@@ -844,31 +864,47 @@ def phase_jellyfin_libraries():
             timeout=30,
         )
         if r.status_code in (200, 204):
-            ok(f"  Library added: {name} → {paths}")
+            ok(f"  Library added: {name} → {valid}")
+        elif r.status_code == 409:
+            info(f"  Library '{name}' already exists — skipping.")
         else:
-            warn(f"  Library '{name}' may already exist or failed: {r.status_code}")
+            warn(f"  Library '{name}' failed: HTTP {r.status_code} — {r.text[:200]}")
+            warn(f"  Add manually in Jellyfin: Dashboard -> Libraries -> + Add Media Library")
 
-    # Kids Movies (separate library for future parental controls)
-    kids_path = str(Path(mount) / env("NAS_MOVIES_KIDS_DIR", "Videos/Movies/Kids"))
-    add_library("Kids Movies", "movies", [kids_path])
+    # ── Movies ────────────────────────────────────────────────────────────────
+    # Support both split Kids/Adult layout and flat Movies layout.
+    kids_configured  = env("NAS_MOVIES_KIDS_DIR",  "Videos/Movies/Kids")
+    adult_configured = env("NAS_MOVIES_ADULT_DIR",  "Videos/Movies/Adult")
+    kids_path  = str(Path(mount) / kids_configured)
+    adult_path = str(Path(mount) / adult_configured)
+    flat_movies = str(Path(mount) / "Videos/Movies")
 
-    # Adult Movies
-    adult_path = str(Path(mount) / env("NAS_MOVIES_ADULT_DIR", "Videos/Movies/Adult"))
-    add_library("Movies", "movies", [adult_path])
+    if Path(kids_path).exists():
+        add_library("Kids Movies", "movies", [kids_path])
+    else:
+        info(f"  Kids movies subdir not found ({kids_path}) — skipping separate library.")
 
-    # TV Shows
+    if Path(adult_path).exists():
+        add_library("Movies", "movies", [adult_path])
+    elif Path(flat_movies).exists():
+        info(f"  No Movies/Adult subdir found — using flat Movies folder: {flat_movies}")
+        add_library("Movies", "movies", [flat_movies])
+    else:
+        warn(f"  No movies path found at {adult_path} or {flat_movies}")
+
+    # ── TV Shows ──────────────────────────────────────────────────────────────
     shows_path = str(Path(mount) / env("NAS_SHOWS_DIR", "Videos/TV Shows"))
     add_library("TV Shows", "tvshows", [shows_path])
 
-    # Fitness
+    # ── Fitness ───────────────────────────────────────────────────────────────
     fitness_path = str(Path(mount) / env("NAS_FITNESS_DIR", "Videos/Fitness"))
     add_library("Fitness", "homevideos", [fitness_path])
 
-    # Stand Up Comedy
+    # ── Stand Up Comedy ───────────────────────────────────────────────────────
     standup_path = str(Path(mount) / env("NAS_STANDUP_DIR", "Videos/Stand Up Comedy"))
     add_library("Stand Up Comedy", "homevideos", [standup_path])
 
-    ok("Jellyfin libraries configured.")
+    ok("Jellyfin libraries phase complete.")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PHASE 6 — Create Jellyfin media user
@@ -1329,6 +1365,14 @@ def phase_install_services():
     install_script = REPO_ROOT / "tools" / "install_services.sh"
     if not install_script.exists():
         die(f"tools/install_services.sh not found at {install_script}")
+
+    # Kill any ErsatzTV process launched by bootstrap (Popen) before systemd takes over.
+    # If a stale instance is alive, systemd will see "Another instance already running" and fail.
+    info("Ensuring no stale ErsatzTV process before systemd handoff...")
+    run_shell("pkill -TERM -f ErsatzTV 2>/dev/null || true", check=False)
+    time.sleep(3)
+    run_shell("pkill -KILL -f ErsatzTV 2>/dev/null || true", check=False)
+    time.sleep(1)
 
     run_shell(f"sudo bash {install_script}")
     ok("systemd services installed.")
