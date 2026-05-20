@@ -678,11 +678,26 @@ def phase_jellyfin_wizard():
         save_env("JELLYFIN_ADMIN_PASS", jf_pass)
         ok(f"Generated admin password and saved to .env")
 
-    # Check if wizard already complete (startup wizard endpoint returns 404 when done)
-    r = requests.get(f"{jf_host}/Startup/Configuration", timeout=10)
-    if r.status_code == 404:
-        ok("Jellyfin wizard already completed.")
-        return
+    # Wait for Jellyfin's internal state machine to be fully ready
+    # (health endpoint responding is not enough — wizard API needs extra time)
+    info("Waiting for Jellyfin wizard API to be ready...")
+    wizard_ready = False
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        try:
+            r = requests.get(f"{jf_host}/Startup/Configuration", timeout=5)
+            if r.status_code == 404:
+                ok("Jellyfin wizard already completed.")
+                return
+            if r.status_code == 200:
+                wizard_ready = True
+                break
+        except Exception:
+            pass
+        time.sleep(3)
+
+    if not wizard_ready:
+        die("Jellyfin wizard API didn't become ready within 60s. Try re-running with --skip-jellyfin.")
 
     info("Running Jellyfin startup wizard...")
 
@@ -690,13 +705,21 @@ def phase_jellyfin_wizard():
     requests.post(f"{jf_host}/Startup/Configuration",
         json={"UICulture": "en-US", "MetadataCountryCode": "US", "PreferredMetadataLanguage": "en"},
         timeout=15)
+    time.sleep(2)
 
-    # Step 2: Create admin user
-    r = requests.post(f"{jf_host}/Startup/User",
-        json={"Name": jf_user, "Password": jf_pass},
-        timeout=15)
-    if r.status_code not in (200, 204):
-        die(f"Jellyfin wizard user creation failed: {r.status_code} {r.text[:200]}")
+    # Step 2: Create admin user — retry up to 5 times in case Jellyfin needs a moment
+    last_err = None
+    for attempt in range(5):
+        r = requests.post(f"{jf_host}/Startup/User",
+            json={"Name": jf_user, "Password": jf_pass},
+            timeout=15)
+        if r.status_code in (200, 204):
+            break
+        last_err = f"{r.status_code} {r.text[:200]}"
+        warn(f"  Wizard user creation attempt {attempt+1} returned {r.status_code} — retrying in 3s...")
+        time.sleep(3)
+    else:
+        die(f"Jellyfin wizard user creation failed after 5 attempts: {last_err}")
 
     # Step 3: Complete wizard
     requests.post(f"{jf_host}/Startup/Complete", timeout=15)
