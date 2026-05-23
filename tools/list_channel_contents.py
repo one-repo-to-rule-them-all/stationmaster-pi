@@ -179,4 +179,25 @@ def main() -> int:
                         help="Channel number to inspect")
     parser.add_argument("--all", "-a", action="store_true",
                         help="Print a summary table of all channels")
-    pars
+    parser.add_argument("--limit", "-l", type=int, default=200,
+                        help="Max items to show per channel (default 200)")
+    args = parser.parse_args()
+
+    if not args.channel and not args.all:
+        parser.print_help()
+        return 1
+
+    con = open_db()
+    cur = con.cursor()
+
+    if args.all:
+        all_channels_summary(cur)
+    else:
+        list_channel(cur, args.channel, args.limit)
+
+    con.close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

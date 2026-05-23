@@ -18,7 +18,7 @@ from pathlib import Path
 
 ETV_DB_PATH = Path.home() / ".local/share/ersatztv/ersatztv.sqlite3"
 
-SCHEDULE_KIND = {0: "Off", 1: "Classic", 2: "Flood", 3: "Block"}
+PLAYBACK_ORDER = {0: "Standard", 1: "Shuffle", 2: "ShufInOrder", 3: "Chrono"}
 GREEN  = "\033[32m"
 YELLOW = "\033[33m"
 RED    = "\033[31m"
@@ -45,7 +45,7 @@ def main() -> int:
 
     channels = cur.execute(f"""
         SELECT c.Id, c.Number, c.Name,
-               ps.ScheduleKind,
+               MAX(psi.PlaybackOrder)  AS PlaybackOrder,
                COUNT(DISTINCT psi.Id)  AS sched_items,
                p.Id                    AS playout_id,
                COUNT(DISTINCT pi.Id)   AS playout_items,
@@ -76,7 +76,7 @@ def main() -> int:
 
     issues = 0
     for ch in channels:
-        kind      = SCHEDULE_KIND.get(ch["ScheduleKind"] or 0, "?")
+        kind      = PLAYBACK_ORDER.get(ch["PlaybackOrder"] or 0, "?")
         pi_count  = ch["playout_items"] or 0
         anchor    = ch["anchor_time"] or ""
         sched_cnt = ch["sched_items"] or 0
@@ -89,8 +89,8 @@ def main() -> int:
             flags.append("0 ITEMS")
         if sched_cnt == 0:
             flags.append("NO SCHEDULE")
-        if ch["ScheduleKind"] not in (1, 2, 3):
-            flags.append(f"BAD KIND ({ch['ScheduleKind']})")
+        if ch["PlaybackOrder"] not in (0, 1, 2, 3):
+            flags.append(f"BAD ORDER ({ch['PlaybackOrder']})")
 
         if anchor:
             try:
