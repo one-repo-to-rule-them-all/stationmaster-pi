@@ -260,6 +260,68 @@ Summary:  N ok  0 warn  0 fail
 
 ---
 
+## Remote access and development
+
+The Pi may be on a different subnet than your laptop (e.g. Pi on `192.168.68.x`, laptop on `192.168.40.x`). Standard LAN SSH won't work in that case. **Tailscale** is the cleanest fix — it creates a mesh VPN between devices regardless of subnet or NAT.
+
+### Option A — Tailscale (recommended for cross-subnet)
+
+**On the Pi:**
+```bash
+curl -fsSL https://tailscale.com/install.sh | sh
+sudo tailscale up
+# Follow the auth URL printed to the terminal
+```
+
+**On your laptop:**
+Install Tailscale from https://tailscale.com/download, log in with the same account.
+
+Once both devices are in the same Tailscale network, find the Pi's Tailscale IP:
+```bash
+tailscale ip -4   # run on the Pi
+```
+
+Then SSH from your laptop using that IP:
+```bash
+ssh cmpe8803@<tailscale-ip>
+```
+
+### Option B — Same subnet (simple)
+
+If your laptop and Pi are on the same network, find the Pi's LAN IP:
+```bash
+hostname -I   # run on the Pi
+```
+
+Then SSH directly:
+```bash
+ssh cmpe8803@<pi-lan-ip>
+# or if mDNS resolves:
+ssh cmpe8803@stationmaster.local
+```
+
+> **Note:** `stationmaster.local` only resolves on Linux/macOS. On Windows, use the IP directly or install Bonjour Print Services.
+
+### VS Code Remote-SSH
+
+1. Install the **Remote - SSH** extension in VS Code (Extension ID: `ms-vscode-remote.remote-ssh`)
+2. Open the Command Palette → **Remote-SSH: Connect to Host** → `cmpe8803@<tailscale-or-lan-ip>`
+3. VS Code opens a remote session — you can edit files on the Pi directly, use the integrated terminal, and drag-drop files in the Explorer panel
+
+### File transfer
+
+Copy a file from your Windows machine to the Pi:
+```powershell
+scp "C:\path\to\file.py" cmpe8803@<pi-ip>:~/Software_repos/stationmaster-pi-main/tools/
+```
+
+Copy from Pi back to Windows:
+```powershell
+scp cmpe8803@<pi-ip>:~/Software_repos/stationmaster-pi-main/tools/file.py "C:\dest\"
+```
+
+---
+
 ## Day-2 operations
 
 | Situation | Command |
@@ -439,6 +501,9 @@ stationmaster-pi/
 ├── full_setup.py             # ErsatzTV channel builder + JF wire-up
 ├── tools/
 │   ├── diagnose.py           # health check — START HERE when broken
+│   ├── verify_schedule.py    # audit all channel playouts for health/staleness
+│   ├── list_channel_contents.py  # show what media is assigned to each channel
+│   ├── purge_stale_media.py  # wipe orphaned MediaFile rows after library changes
 │   ├── factory_reset.py      # clean-slate rebuild
 │   ├── full_cleanup.py       # 7-stage maintenance pipeline
 │   ├── jf_cleanup_dups.py    # prune duplicate JF tuners/providers
