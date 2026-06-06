@@ -1,0 +1,17 @@
+[Unit]
+Description=Resolve NAS IP by MAC and publish to /etc/hosts
+Documentation=file:///usr/local/sbin/nas-resolve.sh
+After=network-online.target
+Wants=network-online.target
+# Must finish before the CIFS mount tries to resolve the hostname
+Before=mnt-nas.mount
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/nas-resolve.sh
+# Give the LAN sweep room to find the NAS on a cold boot
+TimeoutStartSec=90
+
+[Install]
+WantedBy=multi-user.target
