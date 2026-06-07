@@ -321,13 +321,13 @@ def check_jellyfin_tuner(env: dict, token: str | None) -> bool:
         warn("JFCFG", "No auth token — skipping tuner check")
         return True  # treat as non-blocking
 
-    code, body = http_get(f"{host}/LiveTv/TunerHosts", token=token, timeout=5)
+    code, body = http_get(f"{host}/System/Configuration/livetv", token=token, timeout=5)
     if code != 200:
         fail("JFCFG", f"Could not fetch tuner list (HTTP {code})")
         return False
 
     try:
-        tuners = json.loads(body)
+        tuners = json.loads(body).get("TunerHosts", [])
     except Exception:
         fail("JFCFG", "Could not parse tuner response")
         return False
@@ -360,13 +360,13 @@ def check_jellyfin_epg(env: dict, token: str | None) -> bool:
         warn("JFEPG", "No auth token — skipping EPG check")
         return True
 
-    code, body = http_get(f"{host}/LiveTv/ListingProviders", token=token, timeout=5)
+    code, body = http_get(f"{host}/System/Configuration/livetv", token=token, timeout=5)
     if code != 200:
         fail("JFEPG", f"Could not fetch listing providers (HTTP {code})")
         return False
 
     try:
-        providers = json.loads(body)
+        providers = json.loads(body).get("ListingProviders", [])
     except Exception:
         fail("JFEPG", "Could not parse listing providers response")
         return False

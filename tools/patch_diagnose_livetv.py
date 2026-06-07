@@ -30,16 +30,21 @@ repls = [
      '        providers = json.loads(body).get("ListingProviders", [])\n'),
 ]
 
+# Key off whether the OLD pattern is still present. (Both http_get lines share
+# the same replacement target, so a "is the new string present?" guard would
+# wrongly skip the second one once the first is applied.)
 applied, skipped = [], []
 for old, new in repls:
-    if new in src:
+    if old in src:
+        src = src.replace(old, new, 1)
+        applied.append(old[:45])
+    else:
         skipped.append(old[:45])
-        continue
-    if old not in src:
-        print(f"!! pattern not found (diagnose.py may differ): {old[:60]}")
-        sys.exit(2)
-    src = src.replace(old, new, 1)
-    applied.append(old[:45])
+
+# Safety net: no stale Live TV GET endpoints may remain.
+if 'http_get(f"{host}/LiveTv/' in src:
+    print("!! stale Live TV endpoint still present — diagnose.py differs from expected")
+    sys.exit(2)
 
 if src == orig:
     print("Already patched — no changes needed.")
