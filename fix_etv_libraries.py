@@ -112,7 +112,7 @@ for name, kind, paths in LIBRARIES:
         cur.execute("UPDATE Library SET MediaKind=?, LastScan=NULL WHERE Id=?", (kind, lib_id))
         info(f"  Reusing library '{name}' (id={lib_id})")
     else:
-        cur.execute("INSERT INTO Library (Name, MediaKind, LastScan) VALUES (?,?,NULL)", (name, kind))
+        cur.execute("INSERT INTO Library (Name, MediaKind, MediaSourceId, LastScan) VALUES (?,?,1,NULL)", (name, kind))
         lib_id = cur.lastrowid
         ok(f"  Created library '{name}' (id={lib_id})")
 
